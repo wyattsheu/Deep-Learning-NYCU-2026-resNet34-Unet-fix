@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torchinfo import summary
+
 
 from oxford_pet import OxfordPetDataset
 from models.unet import UNet
@@ -76,15 +78,27 @@ def train():
     else:
         model = ResNet34_UNet().to(device)
 
-    if hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            print("torch.compile enabled")
-        except Exception as e:
-            print(f"torch.compile skipped: {e}")
+    # if hasattr(torch, "compile"):
+    #     try:
+    #         model = torch.compile(model, mode="reduce-overhead")
+    #         print("torch.compile enabled")
+    #     except Exception as e:
+    #         print(f"torch.compile skipped: {e}")
 
     print(f"device: {device}")
     print(f"training by {model_type} model")
+
+    print("\n" + "=" * 60)
+    print(f"🔍 正在掃描 {model_type} 模型內部架構...")
+    print("=" * 60)
+    # 這裡的 IMG_SIZE 會自動抓取你在上面設定的 572 (UNet) 或 256 (ResNet)
+    summary(
+        model,
+        input_size=(1, 3, IMG_SIZE, IMG_SIZE),
+        col_names=["input_size", "output_size", "num_params", "kernel_size"],
+        depth=4,
+    )
+    print("=" * 60 + "\n")
 
     bce_loss_fn = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=Learning_rate)
