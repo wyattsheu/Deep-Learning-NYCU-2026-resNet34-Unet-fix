@@ -1,4 +1,5 @@
 import os
+import argparse
 
 # 加入這行來減少 CUDA 記憶體破碎化
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -34,11 +35,11 @@ def dice_loss_from_logits(logits, targets, smooth=1.0):
     return 1.0 - dice.mean()
 
 
-def train():
-    Epochs = 50
-    Batch_size = 24
-    Learning_rate = 1e-4
-    model_type = "UNet"  # 可選擇 "UNet" 或 "ResNet34_UNet"
+def train(Epochs=30, Batch_size=24, Learning_rate=1e-4, model_type="ResNet34_UNet"):
+    Epochs = Epochs
+    Batch_size = Batch_size
+    Learning_rate = Learning_rate
+    model_type = model_type  # 可選擇 "UNet" 或 "ResNet34_UNet"
 
     project_root = os.path.abspath(os.getcwd())
     data_dir = os.path.join(project_root, "dataset")
@@ -93,6 +94,7 @@ def train():
         input_size=(1, 3, IMG_SIZE, IMG_SIZE),
         col_names=["input_size", "output_size", "num_params", "kernel_size"],
         depth=4,
+        device=device,
     )
     print("=" * 60 + "\n")
 
@@ -203,4 +205,35 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(
+        description="Train the model with specified parameters."
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=30, help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=24, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Learning rate for the optimizer",
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["UNet", "ResNet34_UNet"],
+        default="ResNet34_UNet",
+        help="Type of model to train",
+    )
+
+    args = parser.parse_args()
+
+    train(
+        Epochs=args.epochs,
+        Batch_size=args.batch_size,
+        Learning_rate=args.learning_rate,
+        model_type=args.model_type,
+    )
+# python3 src/train.py --epochs 30 --batch_size 24 --learning_rate 0.0001 --model_type UNet or ResNet34_UNet
