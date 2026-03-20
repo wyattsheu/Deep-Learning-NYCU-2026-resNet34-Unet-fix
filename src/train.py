@@ -97,12 +97,12 @@ def train():
     print(f"device: {device}")
     print(f"training by {model_type} model")
     ###########應註解掉
-    if hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            print("torch.compile enabled")
-        except Exception as e:
-            print(f"torch.compile skipped: {e}")
+    # if hasattr(torch, "compile"):
+    #     try:
+    #         model = torch.compile(model, mode="reduce-overhead")
+    #         print("torch.compile enabled")
+    #     except Exception as e:
+    #         print(f"torch.compile skipped: {e}")
 
     # # 如果有多個 GPU，使用 nn.DataParallel
     if torch.cuda.device_count() > 1:
