@@ -36,7 +36,7 @@ def dice_loss_from_logits(logits, targets, smooth=1.0):
 
 def train():
     Epochs = 50
-    Batch_size = 32 if torch.cuda.device_count() > 1 else 16
+    Batch_size = 48
     Learning_rate = 1e-4
     model_type = "UNet"  # 可選擇 "UNet" 或 "ResNet34_UNet"
 
