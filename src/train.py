@@ -98,6 +98,8 @@ def train():
 
     print(f"device: {device}")
     print(f"training by {model_type} model")
+    print(f"batch size: {Batch_size}")
+
     ###########應註解掉
     # if hasattr(torch, "compile"):
     #     try:
@@ -107,9 +109,9 @@ def train():
     #         print(f"torch.compile skipped: {e}")
 
     # # 如果有多個 GPU，使用 nn.DataParallel
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs with nn.DataParallel")
-        model = nn.DataParallel(model)
+    # if torch.cuda.device_count() > 1:
+    #     print(f"Using {torch.cuda.device_count()} GPUs with nn.DataParallel")
+    #     model = nn.DataParallel(model)
     ###########
 
     bce_loss_fn = nn.BCEWithLogitsLoss()
@@ -192,10 +194,11 @@ def train():
             best_dice = val_dice
 
             save_path = os.path.join(save_dir, f"best_{model_type}.pth")
-            # 🔥 神奇的一行：自動適應單卡/多卡環境
-            model_to_save = model.module if hasattr(model, "module") else model
-            # torch.save(model.state_dict(), save_path)
-            torch.save(model_to_save.state_dict(), save_path)
+            # # 🔥 神奇的一行：自動適應單卡/多卡環境
+            # model_to_save = model.module if hasattr(model, "module") else model
+            # torch.save(model_to_save.state_dict(), save_path)
+            torch.save(model.state_dict(), save_path)
+
             print(f"new model saved at {save_path}\n")
 
 
