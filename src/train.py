@@ -162,6 +162,12 @@ def train():
                 # out = raw_model(image)
                 ###
                 out = model(image)
+
+                # 🌟 加入這行防護罩：確保 mask 跟 out 的形狀完全一樣 (例如 B, 1, 388, 388)
+                if mask.shape != out.shape:
+                    mask = mask.view_as(out)
+                #####
+
                 bce_loss = bce_loss_fn(out, mask)
                 dice_loss = dice_loss_from_logits(out, mask)
                 loss = 0.2 * bce_loss + 0.8 * dice_loss
