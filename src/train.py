@@ -2,6 +2,8 @@ import os
 
 # 加入這行來減少 CUDA 記憶體破碎化
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # 🔥 抓底層 Bug 的照妖鏡
+
 
 from contextlib import nullcontext
 import torch
@@ -162,11 +164,6 @@ def train():
                 # out = raw_model(image)
                 ###
                 out = model(image)
-
-                # 🌟 加入這行防護罩：確保 mask 跟 out 的形狀完全一樣 (例如 B, 1, 388, 388)
-                if mask.shape != out.shape:
-                    mask = mask.view_as(out)
-                #####
 
                 bce_loss = bce_loss_fn(out, mask)
                 dice_loss = dice_loss_from_logits(out, mask)
