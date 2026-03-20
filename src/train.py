@@ -78,6 +78,20 @@ def train():
     else:
         model = ResNet34_UNet().to(device)
 
+    print("\n" + "=" * 60)
+    print(f"🔍 正在掃描 {model_type} 模型內部架構...")
+    print("=" * 60)
+    # 這裡的 IMG_SIZE 會自動抓取你在上面設定的 572 (UNet) 或 256 (ResNet)
+    summary(
+        model,
+        input_size=(1, 3, IMG_SIZE, IMG_SIZE),
+        col_names=["input_size", "output_size", "num_params", "kernel_size"],
+        depth=4,
+    )
+    print("=" * 60 + "\n")
+
+    print(f"device: {device}")
+    print(f"training by {model_type} model")
     ###########應註解掉
     if hasattr(torch, "compile"):
         try:
@@ -91,21 +105,6 @@ def train():
         print(f"Using {torch.cuda.device_count()} GPUs with nn.DataParallel")
         model = nn.DataParallel(model)
     ###########
-
-    print(f"device: {device}")
-    print(f"training by {model_type} model")
-
-    print("\n" + "=" * 60)
-    print(f"🔍 正在掃描 {model_type} 模型內部架構...")
-    print("=" * 60)
-    # 這裡的 IMG_SIZE 會自動抓取你在上面設定的 572 (UNet) 或 256 (ResNet)
-    summary(
-        model,
-        input_size=(1, 3, IMG_SIZE, IMG_SIZE),
-        col_names=["input_size", "output_size", "num_params", "kernel_size"],
-        depth=4,
-    )
-    print("=" * 60 + "\n")
 
     bce_loss_fn = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(
@@ -179,8 +178,16 @@ def train():
 
         if val_dice > best_dice:
             best_dice = val_dice
+
             save_path = os.path.join(save_dir, f"best_{model_type}.pth")
-            torch.save(model.state_dict(), save_path)
+            # torch.save(model.state_dict(), save_path)
+            # 🌟 判斷是否有被 DataParallel 包裝，有則脫殼儲存
+            if isinstance(model, nn.DataParallel):
+                torch.save(model.module.state_dict(), save_path)
+            else:
+                torch.save(model.state_dict(), save_path)
+            ##########!!!!Notion
+
             print(f"new model saved at {save_path}\n")
 
 
