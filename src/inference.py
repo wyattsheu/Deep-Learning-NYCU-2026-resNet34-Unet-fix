@@ -5,11 +5,11 @@ import os
 import numpy as np
 import torch
 import torchvision.transforms as T
-from datasets import load_dataset
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from oxford_pet import OxfordPetDataset
 from models.resnet34_unet import ResNet34_UNet
 from models.unet import UNet
 from utils import (
@@ -80,67 +80,6 @@ def load_image_ids(data_dir: str, split_file: str = None, model_type: str = "UNe
         raise ValueError(f"No image IDs found in split file: {chosen_path}")
 
     return image_ids, chosen_path
-
-
-class OxfordPetInferenceDataset(Dataset):
-    def __init__(self, data_dir: str, image_ids, load_gt: bool):
-        self.data_dir = os.path.abspath(data_dir)
-        self.image_ids = image_ids
-        self.load_gt = load_gt
-        self.transform = T.Compose([T.Resize(INPUT_SIZE), T.ToTensor()])
-
-    def __len__(self):
-        return len(self.image_ids)
-
-    def __getitem__(self, idx):
-        image_id = self.image_ids[idx]
-
-        image_path = os.path.join(self.data_dir, "images", image_id + ".jpg")
-        image = Image.open(image_path).convert("RGB")
-        orig_w, orig_h = image.size
-        image_tensor = self.transform(image)
-
-        if not self.load_gt:
-            return image_tensor, image_id, torch.tensor([orig_h, orig_w])
-
-        mask_path = os.path.join(
-            self.data_dir, "annotations", "trimaps", image_id + ".png"
-        )
-        mask = Image.open(mask_path).resize(INPUT_SIZE, resample=Image.NEAREST)
-        mask_array = np.array(mask)
-        binary_mask = np.zeros_like(mask_array, dtype=np.float32)
-        binary_mask[mask_array == 1] = 1.0
-        binary_mask = center_crop_mask(binary_mask, TARGET_SIZE[0], TARGET_SIZE[1])
-        mask_tensor = torch.from_numpy(binary_mask).unsqueeze(0)
-        return image_tensor, image_id, mask_tensor, torch.tensor([orig_h, orig_w])
-
-
-class OxfordPetInferenceHFDataset(Dataset):
-    def __init__(self, hf_dataset_name: str, split: str):
-        self.dataset = load_dataset(hf_dataset_name, split=split)
-        self.transform = T.Compose([T.Resize(INPUT_SIZE), T.ToTensor()])
-
-        self.image_ids = []
-        for idx in range(len(self.dataset)):
-            item = self.dataset[idx]
-            image_id = item.get("filename")
-            if image_id is None:
-                image_id = item.get("image_id")
-            if image_id is None:
-                image_id = str(idx)
-            self.image_ids.append(image_id)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        image_id = self.image_ids[idx]
-
-        image = item["image"].convert("RGB")
-        orig_w, orig_h = image.size
-        image_tensor = self.transform(image)
-        return image_tensor, image_id, torch.tensor([orig_h, orig_w])
 
 
 def verify_unet_output_shape(model, device):
@@ -222,33 +161,42 @@ def run_inference(args):
     if model_type == "UNet":
         verify_unet_output_shape(model, device)
 
+    # Inference 統一走 OxfordPetDataset（內部由 HF load_dataset 取圖），不再讀本地 jpg。
     if hf_dataset_name:
-        # HF 資料集雖有 mask，但 inference 階段只需讀 image 與檔名。
-        gt_available = False
-        test_dataset = OxfordPetInferenceHFDataset(
-            hf_dataset_name=hf_dataset_name,
-            split=hf_split,
-        )
-        image_ids = test_dataset.image_ids
-        split_path = f"hf://{hf_dataset_name}/{hf_split}"
-    else:
-        image_ids, split_path = load_image_ids(
-            data_dir=data_dir,
-            split_file=args.split_file,
-            model_type=model_type,
-        )
+        OxfordPetDataset.HF_DATASET_NAME = hf_dataset_name
 
-        trimap_dir = os.path.join(data_dir, "annotations", "trimaps")
-        gt_available = all(
-            os.path.exists(os.path.join(trimap_dir, image_id + ".png"))
-            for image_id in image_ids
-        )
+    split_name = (
+        hf_split
+        if hf_split
+        else ("test_unet" if model_type == "UNet" else "test_res_unet")
+    )
+    if not split_name.startswith("test"):
+        raise ValueError("For inference, split must be a test split (e.g. test_unet).")
 
-        test_dataset = OxfordPetInferenceDataset(
-            data_dir=data_dir,
-            image_ids=image_ids,
-            load_gt=gt_available,
-        )
+    split_dir = data_dir
+    split_path = os.path.join(split_dir, f"{split_name}.txt")
+    if not os.path.exists(split_path):
+        parent_dir = os.path.dirname(split_dir)
+        parent_split_path = os.path.join(parent_dir, f"{split_name}.txt")
+        if os.path.exists(parent_split_path):
+            split_dir = parent_dir
+            split_path = parent_split_path
+        else:
+            raise FileNotFoundError(
+                f"Cannot find split file for inference: {split_path} or {parent_split_path}"
+            )
+
+    test_dataset = OxfordPetDataset(
+        data_dir=split_dir,
+        split=split_name,
+        image_size=INPUT_SIZE[0],
+        mask_size=TARGET_SIZE[0],
+        return_mask_for_test=True,
+        return_unpadded_for_test=True,
+    )
+    image_ids = test_dataset.target_names
+    gt_available = True
+
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     submissions = []
@@ -259,10 +207,10 @@ def run_inference(args):
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Inference"):
             if gt_available:
-                images, batch_image_ids, gt_masks, orig_sizes = batch
+                images, batch_image_ids, gt_masks, orig_sizes, vis_images = batch
                 gt_masks = gt_masks.to(device)
             else:
-                images, batch_image_ids, orig_sizes = batch
+                images, batch_image_ids, orig_sizes, vis_images = batch
                 gt_masks = None
 
             images = images.to(device)
@@ -292,7 +240,7 @@ def run_inference(args):
                 submissions.append((image_id, encoded_mask))
 
                 if len(vis_buffer) < num_vis:
-                    image_vis = images[idx].detach().cpu()
+                    image_vis = vis_images[idx].detach().cpu()
                     pred_vis = torch.from_numpy(binary_mask)
                     target_vis = None
                     if gt_available:

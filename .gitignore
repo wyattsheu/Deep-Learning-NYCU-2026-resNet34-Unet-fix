@@ -19,6 +19,7 @@ __pycache__/
 # 如果未來你在這裡放入原始圖檔 (如 .jpg, .png)，建議過濾掉：
 # Lab2/dataset/*.jpg
 # Lab2/dataset/*.png
+dataset/oxford-iiit-pet/
 
 # 預測結果輸出
 results/
