@@ -155,6 +155,14 @@ class OxfordPetDataset(Dataset):
                     interpolation=InterpolationMode.NEAREST,
                     fill=0,
                 )
+            if random.random() > 0.5:
+                # 隨機調整亮度 (0.8~1.2)
+                brightness_factor = random.uniform(0.8, 1.2)
+                image = TF.adjust_brightness(image, brightness_factor)
+
+                # 隨機調整對比度 (0.8~1.2)
+                contrast_factor = random.uniform(0.8, 1.2)
+                image = TF.adjust_contrast(image, contrast_factor)
 
         # augmentation 之後再做 resize/pad，確保 image/mask 幾何同步。
         image_tensor = self.image_transform(image)

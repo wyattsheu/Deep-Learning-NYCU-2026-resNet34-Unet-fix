@@ -35,7 +35,7 @@ def dice_loss_from_logits(logits, targets, smooth=1.0):
     return 1.0 - dice.mean()
 
 
-def train(Epochs=30, Batch_size=24, Learning_rate=1e-4, model_type="ResNet34_UNet"):
+def train(Epochs=60, Batch_size=24, Learning_rate=1e-4, model_type="ResNet34_UNet"):
     Epochs = Epochs
     Batch_size = Batch_size
     Learning_rate = Learning_rate
@@ -171,7 +171,7 @@ def train(Epochs=30, Batch_size=24, Learning_rate=1e-4, model_type="ResNet34_UNe
 
                 bce_loss = bce_loss_fn(out, mask)
                 dice_loss = dice_loss_from_logits(out, mask)
-                loss = 0.2 * bce_loss + 0.8 * dice_loss
+                loss = 0.4 * bce_loss + 0.6 * dice_loss
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -209,7 +209,7 @@ if __name__ == "__main__":
         description="Train the model with specified parameters."
     )
     parser.add_argument(
-        "--epochs", type=int, default=30, help="Number of training epochs"
+        "--epochs", type=int, default=60, help="Number of training epochs"
     )
     parser.add_argument(
         "--batch_size", type=int, default=24, help="Batch size for training"
