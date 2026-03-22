@@ -1,9 +1,10 @@
 import torch
 from utils import calculate_dice_score
 
+
 def evaluate(model, dataloader, device):
     """
-    TODO: 
+    TODO:
     1. 將模型設為 eval 模式 (model.eval())。
     2. 關閉梯度計算 (torch.no_grad())。
     3. 跑過整個 validation dataloader，計算平均的 Loss 與 Dice Score。
