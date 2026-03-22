@@ -4,9 +4,8 @@ import os
 
 import numpy as np
 import torch
-import torchvision.transforms as T
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from oxford_pet import OxfordPetDataset
@@ -18,8 +17,51 @@ from utils import (
 )
 
 
-INPUT_SIZE = (572, 572)
-TARGET_SIZE = (388, 388)
+try:
+    NEAREST_RESAMPLE = Image.Resampling.NEAREST
+except AttributeError:
+    NEAREST_RESAMPLE = Image.NEAREST if hasattr(Image, "NEAREST") else 0
+
+
+def get_model_io_size(model_type: str):
+    if model_type == "UNet":
+        return (572, 572), (388, 388)
+    # ResNet34_UNet is trained with same-size input/output in this project.
+    return (512, 512), (512, 512)
+
+
+def infer_model_type_from_checkpoint(model_path: str):
+    name = os.path.basename(model_path).lower()
+    if "resnet34_unet" in name or name == "resnet34_unet.pth":
+        return "ResNet34_UNet"
+    if "unet" in name:
+        return "UNet"
+    return None
+
+
+def auto_pick_checkpoint(model_path: str, model_type: str):
+    if model_path:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+        inferred = infer_model_type_from_checkpoint(model_path)
+        final_type = model_type if model_type else inferred
+        return model_path, final_type
+
+    candidates = [
+        ("saved_models/best_ResNet34_UNet.pth", "ResNet34_UNet"),
+        ("saved_models/ResNet34_UNet.pth", "ResNet34_UNet"),
+        ("saved_models/best_UNet.pth", "UNet"),
+        ("saved_models/UNet.pth", "UNet"),
+    ]
+
+    for path, picked_type in candidates:
+        if os.path.exists(path) and (not model_type or model_type == picked_type):
+            return path, picked_type
+
+    raise FileNotFoundError(
+        "Cannot find any checkpoint in saved_models/. "
+        "Checked: " + ", ".join(path for path, _ in candidates)
+    )
 
 
 def center_crop_mask(mask: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
@@ -82,15 +124,14 @@ def load_image_ids(data_dir: str, split_file: str = None, model_type: str = "UNe
     return image_ids, chosen_path
 
 
-def verify_unet_output_shape(model, device):
+def verify_output_shape(model, model_type: str, input_size, target_size, device):
     with torch.no_grad():
-        dummy = torch.zeros(1, 3, INPUT_SIZE[0], INPUT_SIZE[1], device=device)
+        dummy = torch.zeros(1, 3, input_size[0], input_size[1], device=device)
         out = model(dummy)
-    expected = TARGET_SIZE
     actual = tuple(out.shape[-2:])
-    if actual != expected:
+    if actual != target_size:
         raise ValueError(
-            f"UNet output shape mismatch. Expected {expected}, got {actual}."
+            f"{model_type} output shape mismatch. Expected {target_size}, got {actual}."
         )
 
 
@@ -125,7 +166,7 @@ def validate_submission_rows(rows, expected_ids):
 
 def run_inference(args):
     model_type = args.model_type
-    model_path = args.model_path or f"saved_models/best_{model_type}.pth"
+    model_path = args.model_path
     data_dir = args.data_dir
     hf_dataset_name = args.hf_dataset_name
     hf_split = args.hf_split
@@ -144,22 +185,20 @@ def run_inference(args):
         else "mps" if torch.backends.mps.is_available() else "cpu"
     )
 
+    model_path, detected_type = auto_pick_checkpoint(model_path, model_type)
+    model_type = detected_type
+    input_size, target_size = get_model_io_size(model_type)
+
     if model_type == "UNet":
         model = UNet().to(device)
     else:
         model = ResNet34_UNet().to(device)
 
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Model checkpoint not found: {model_path}. Please train first."
-        )
-
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
 
-    if model_type == "UNet":
-        verify_unet_output_shape(model, device)
+    verify_output_shape(model, model_type, input_size, target_size, device)
 
     # Inference 統一走 OxfordPetDataset（內部由 HF load_dataset 取圖），不再讀本地 jpg。
     if hf_dataset_name:
@@ -186,11 +225,14 @@ def run_inference(args):
                 f"Cannot find split file for inference: {split_path} or {parent_split_path}"
             )
 
+    print(f"inferencing with model: {model_path} (detected type: {model_type})")
+    print(f"Using device: {device}")
+
     test_dataset = OxfordPetDataset(
         data_dir=split_dir,
         split=split_name,
-        image_size=INPUT_SIZE[0],
-        mask_size=TARGET_SIZE[0],
+        image_size=input_size[0],
+        mask_size=target_size[0],
         return_mask_for_test=True,
         return_unpadded_for_test=True,
     )
@@ -214,9 +256,23 @@ def run_inference(args):
                 gt_masks = None
 
             images = images.to(device)
+            # logits = model(images)
+            # probs = torch.sigmoid(logits)
+            # preds = (probs > threshold).float()
+
+            # 原始預測
             logits = model(images)
-            probs = torch.sigmoid(logits)
-            preds = (probs > threshold).float()
+            probs1 = torch.sigmoid(logits)
+
+            # TTA: 水平翻轉預測
+            images_flipped = torch.flip(images, dims=[3])
+            logits_flipped = model(images_flipped)
+            probs_flipped = torch.sigmoid(logits_flipped)
+            probs2 = torch.flip(probs_flipped, dims=[3])
+
+            # 綜合兩次預測結果（平均）
+            final_probs = (probs1 + probs2) / 2.0
+            preds = (final_probs > threshold).float()
 
             if gt_available:
                 batch_dice = calculate_dice_score(preds, gt_masks)
@@ -233,7 +289,7 @@ def run_inference(args):
                 orig_h = int(orig_sizes[idx, 0].item())
                 orig_w = int(orig_sizes[idx, 1].item())
                 mask_img = Image.fromarray((binary_mask * 255).astype(np.uint8))
-                mask_img = mask_img.resize((orig_w, orig_h), resample=Image.NEAREST)
+                mask_img = mask_img.resize((orig_w, orig_h), resample=NEAREST_RESAMPLE)
                 binary_mask_for_submit = (np.array(mask_img) > 127).astype(np.uint8)
 
                 encoded_mask = rle_encode(binary_mask_for_submit)
@@ -250,7 +306,7 @@ def run_inference(args):
 
     issues = validate_submission_rows(submissions, image_ids)
 
-    with open(submission_path, "w", newline="") as f:
+    with open(submission_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["image_id", "encoded_mask"])
         writer.writerows(submissions)
@@ -263,8 +319,7 @@ def run_inference(args):
     print(f"Total test images: {len(image_ids)}")
     print(f"Submission saved to: {submission_path}")
     print(f"Visualization samples showed: {len(vis_buffer)}")
-    if model_type == "UNet":
-        print(f"UNet shape check: input {INPUT_SIZE} -> output {TARGET_SIZE} (PASSED)")
+    print(f"Shape check: input {input_size} -> output {target_size} (PASSED)")
 
     if issues:
         print("Kaggle format check: FAILED")
@@ -291,13 +346,13 @@ def build_argparser():
         type=str,
         default="UNet",
         choices=["UNet", "ResNet34_UNet"],
-        help="Model architecture to run",
+        help="Model architecture hint (ignored if --model-path filename clearly indicates model type)",
     )
     parser.add_argument(
         "--model-path",
         type=str,
         default="",
-        help="Checkpoint path (.pth). If empty, use saved_models/best_<model_type>.pth",
+        help="Checkpoint path (.pth). If empty, auto-detect from saved_models/",
     )
     parser.add_argument(
         "--data-dir",
@@ -314,8 +369,8 @@ def build_argparser():
     parser.add_argument(
         "--hf-split",
         type=str,
-        default="test_unet",
-        help="HF split name to run inference on (train/val/test_unet/test_res_unet).",
+        default="",
+        help="HF split name to run inference on. If empty, auto-select by model type.",
     )
     parser.add_argument(
         "--split-file",
@@ -357,5 +412,5 @@ def build_argparser():
 
 
 if __name__ == "__main__":
-    parser = build_argparser()
-    run_inference(parser.parse_args())
+    arg_parser = build_argparser()
+    run_inference(arg_parser.parse_args())
