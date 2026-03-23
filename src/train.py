@@ -204,7 +204,7 @@ def train(
                 else:
                     bce_loss = nn.BCEWithLogitsLoss()(out, mask)
                     dice_loss = dice_loss_from_logits(out, mask)
-                    loss = 0.4 * bce_loss + 0.6 * dice_loss
+                    loss = 0.1 * bce_loss + 0.9 * dice_loss
 
             # Check for non-finite loss BEFORE backward to avoid corrupting GradScaler state
             if not torch.isfinite(loss):
