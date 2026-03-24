@@ -194,7 +194,7 @@ def train(
                 # 如果模型有被包裝 (有 module 屬性)，就脫殼；如果沒有，就保持原樣
                 # raw_model = model.module if hasattr(model, "module") else model
                 # out = raw_model(image)
-                ###
+                ####
                 out = model(image)
 
                 if model_type == "UNet":
