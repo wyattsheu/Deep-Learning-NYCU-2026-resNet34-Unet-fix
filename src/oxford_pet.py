@@ -235,8 +235,10 @@ class OxfordPetDataset(Dataset):
             elif geom_choice < 0.6:
                 w, h = image.size
                 base_size = max(w, h)
-                elastic_alpha = base_size * 1.5
-                elastic_sigma = base_size * 0.025
+                # elastic_alpha = base_size * 1.5
+                # elastic_sigma = base_size * 0.025
+                elastic_alpha = base_size * 1.25
+                elastic_sigma = base_size * 0.03
                 elastic = v2.ElasticTransform(alpha=elastic_alpha, sigma=elastic_sigma)
                 image, mask = elastic(image, mask)
 
@@ -360,59 +362,67 @@ def _visualize_all_augmentations():
     vis_contrast_factor = 1.15
     vis_noise_sigma = 0.05
 
-    image_hflip = TF.hflip(vis_image)
-
-    image_rotate = TF.rotate(
-        vis_image,
-        vis_angle,
-        interpolation=InterpolationMode.BILINEAR,
-        fill=0,
-    )
-
-    image_clahe = apply_clahe(vis_image)
-
-    w, h = vis_image.size
-    print(f"Original Image Size: {w}x{h}")
-
-    base_size = max(w, h)
-
-    # 業界黃金比例：alpha 為 0.45 倍，sigma 為 0.035 倍
-    elastic_alpha = base_size * 1.5
-    elastic_sigma = base_size * 0.025
-    print(
-        f"Elastic Transform Parameters: alpha={elastic_alpha:.1f}, sigma={elastic_sigma:.1f}"
-    )
-
-    elastic = v2.ElasticTransform(alpha=elastic_alpha, sigma=elastic_sigma)
-    image_elastic, _ = elastic(vis_image, vis_image)
-
-    affine = v2.RandomAffine(
-        degrees=0,
-        translate=(0.1, 0.1),
-        scale=(0.9, 1.1),
-    )
-    image_affine = affine(vis_image)
-
-    image_bc = TF.adjust_brightness(vis_image, vis_brightness_factor)
-    image_bc = TF.adjust_contrast(image_bc, vis_contrast_factor)
-
-    image_noise = add_gaussian_noise(vis_image, sigma=vis_noise_sigma)
-
+    # 🌟 1. 提早建立 Dataset 實例，取得 LetterBox 工具
     vis_ds = OxfordPetDataset(
         data_dir=vis_data_dir,
         split="train",
         image_size=572,
         mask_size=388,
     )
+
+    # 🌟 2. 關鍵修改：先將圖片縮放到模型實際訓練時的解析度 (例如 388x388)
     vis_image_small = vis_ds.letterbox_image(vis_image)
+
+    # 🌟 3. 所有的 Augmentation 都改套用在 "vis_image_small" 上
+    image_hflip = TF.hflip(vis_image_small)
+
+    image_rotate = TF.rotate(
+        vis_image_small,
+        vis_angle,
+        interpolation=InterpolationMode.BILINEAR,
+        fill=0,
+    )
+
+    image_clahe = apply_clahe(vis_image_small)
+
+    # Elastic 也是根據小圖的 size 動態計算
+    w, h = vis_image_small.size
+    print(f"Resized Image Size: {w}x{h}")
+
+    base_size = max(w, h)
+    # 這裡的 alpha/sigma 會自動配合 388 (或 256) 的尺寸算出剛好的力道
+    elastic_alpha = base_size * 1.25
+    elastic_sigma = base_size * 0.03
+    print(
+        f"Elastic Transform Parameters (Scaled): alpha={elastic_alpha:.1f}, sigma={elastic_sigma:.1f}"
+    )
+
+    elastic = v2.ElasticTransform(alpha=elastic_alpha, sigma=elastic_sigma)
+    image_elastic, _ = elastic(vis_image_small, vis_image_small)
+
+    affine = v2.RandomAffine(
+        degrees=0,
+        translate=(0.1, 0.1),
+        scale=(0.9, 1.1),
+    )
+    image_affine = affine(vis_image_small)
+
+    image_bc = TF.adjust_brightness(vis_image_small, vis_brightness_factor)
+    image_bc = TF.adjust_contrast(image_bc, vis_contrast_factor)
+
+    image_noise = add_gaussian_noise(vis_image_small, sigma=vis_noise_sigma)
+
+    # 最終轉 Tensor 並加上鏡像外圍
     image_final = _tensor_to_hwc_uint8(vis_ds.pad_and_tensor(vis_image_small))
     image_unpadded = _tensor_to_hwc_uint8(vis_ds.just_tensor(vis_image_small))
 
     fig, axes = plt.subplots(2, 5, figsize=(24, 10))
     axes = axes.ravel()
 
+    # 🌟 4. 調整顯示順序，讓你在第 2 格就能看到縮放後的基準圖
     items = [
-        (np.array(vis_image), "Original Image 原始影像"),
+        (np.array(vis_image), "Original Image 原圖(大尺寸)"),
+        (image_unpadded, "LetterBox Resize 縮放後基準圖"),
         (np.array(image_hflip), "HFlip Image 水平翻轉"),
         (np.array(image_rotate), f"Rotate {vis_angle:.1f}° 旋轉"),
         (np.array(image_clahe), "CLAHE 增強對比"),
@@ -420,14 +430,13 @@ def _visualize_all_augmentations():
         (np.array(image_affine), "Translation + Zoom 平移+縮放"),
         (
             np.array(image_bc),
-            f"Brightness {vis_brightness_factor:.2f} + Contrast {vis_contrast_factor:.2f} 亮度+對比",
+            f"Brightness {vis_brightness_factor:.2f} + Contrast {vis_contrast_factor:.2f}",
         ),
         (
             np.array(image_noise),
             f"Gaussian Noise 高斯雜訊 (sigma={vis_noise_sigma:.2f})",
         ),
-        (image_unpadded, "LetterBox Resize (mask_size) 等比例縮放"),
-        (image_final, "LetterBox + Reflect Pad (image_size) 填充"),
+        (image_final, "LetterBox + Reflect Pad (image_size) 最終填充"),
     ]
 
     for ax, (arr, title) in zip(axes, items):
@@ -439,7 +448,7 @@ def _visualize_all_augmentations():
         ax.axis("off")
 
     fig.suptitle(
-        f"Oxford Pet Augmentation Visualization: {vis_file_name} 增強視覺化",
+        f"Oxford Pet Augmentation Visualization: {vis_file_name} 實際訓練視野",
         fontsize=16,
     )
     plt.tight_layout(rect=[0, 0.02, 1, 0.96])
