@@ -1,13 +1,11 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
+import scipy.ndimage as ndimage
 
 
 def calculate_dice_score(pred, target):
-    """
-    TODO: 實作 Dice Score 邏輯
-    公式: 2 * (number of common pixels) / (predicted img size + ground truth img size)
-    注意: pred 與 target 應該要是 binary masks (0 與 1)
-    """
+    """計算 Dice Score 供評估使用 (平滑值改為安全的 1e-5)"""
     pred = pred.float()
     target = target.float()
 
@@ -15,14 +13,87 @@ def calculate_dice_score(pred, target):
         pred = torch.sigmoid(pred)
 
     pred = (pred > 0.5).float()
-
     pred = pred.view(pred.size(0), -1)
     target = target.view(target.size(0), -1)
 
     intersection = (pred * target).sum(dim=1)
     denominator = pred.sum(dim=1) + target.sum(dim=1)
-    dice = (2.0 * intersection + 1e-8) / (denominator + 1e-8)
+    dice = (2.0 * intersection + 1e-5) / (denominator + 1e-5)
     return dice.mean().item()
+
+
+# ==========================================
+# 🌟 損失函數區 (Loss Functions)
+# ==========================================
+def dice_loss_from_logits(logits, targets, smooth=1e-5):
+    probs = torch.sigmoid(logits).float()
+    targets = targets.float()
+    probs = probs.view(probs.size(0), -1)
+    targets = targets.view(targets.size(0), -1)
+    intersection = (probs * targets).sum(dim=1)
+    dice = (2.0 * intersection + smooth) / (
+        probs.sum(dim=1) + targets.sum(dim=1) + smooth
+    )
+    return 1.0 - dice.mean()
+
+
+def focal_loss_from_logits(logits, targets, alpha=0.25, gamma=2.0):
+    bce_loss = F.binary_cross_entropy_with_logits(
+        logits, targets.float(), reduction="none"
+    )
+    pt = torch.exp(-torch.clamp(bce_loss, max=100.0))
+    focal_loss = alpha * (1 - pt) ** gamma * bce_loss
+    return focal_loss.mean()
+
+
+def boundary_loss_from_logits(logits, targets):
+    """
+    邊界損失 (Boundary Loss)：
+    利用 MaxPool 產生形態學的膨脹與侵蝕，快速萃取預測機率與標籤的「邊緣輪廓」，
+    強迫模型不能只對準面積，還要完美貼合形狀與邊緣。
+    """
+    probs = torch.sigmoid(logits)
+    targets_float = targets.float()
+
+    # 預測邊緣
+    probs_dilated = F.max_pool2d(probs, kernel_size=3, stride=1, padding=1)
+    probs_eroded = -F.max_pool2d(-probs, kernel_size=3, stride=1, padding=1)
+    probs_boundary = probs_dilated - probs_eroded
+
+    # 真實邊緣
+    targets_dilated = F.max_pool2d(targets_float, kernel_size=3, stride=1, padding=1)
+    targets_eroded = -F.max_pool2d(-targets_float, kernel_size=3, stride=1, padding=1)
+    targets_boundary = targets_dilated - targets_eroded
+
+    return F.mse_loss(probs_boundary, targets_boundary)
+
+
+# ==========================================
+# 🌟 後處理區 (Post-processing)
+# ==========================================
+def postprocess_batch_tensors(preds_tensor):
+    """
+    形態學後處理：填補孔洞 (Hole Filling) 與 保留最大連通域 (Largest Connected Component)
+    能瞬間消除遠處的 False Positives (碎斑)，並讓腫瘤/器官實體更符合解剖學邏輯。
+    """
+    preds_np = (torch.sigmoid(preds_tensor) > 0.5).cpu().numpy()
+    processed_np = np.zeros_like(preds_np)
+
+    for i in range(preds_np.shape[0]):
+        mask = preds_np[i, 0]
+        # 1. 填補內部不合理的破洞
+        mask_filled = ndimage.binary_fill_holes(mask)
+
+        # 2. 保留最大的連通區塊 (假設每張圖只有一個主要實體)
+        labeled, num_feat = ndimage.label(mask_filled)
+        if num_feat > 1:
+            sizes = ndimage.sum(mask_filled, labeled, range(1, num_feat + 1))
+            largest = np.argmax(sizes) + 1
+            processed_np[i, 0] = labeled == largest
+        else:
+            processed_np[i, 0] = mask_filled
+
+    return torch.from_numpy(processed_np).to(preds_tensor.device).float()
 
 
 # 你可以在這裡加入其他的輔助函式，例如視覺化預測結果的 function

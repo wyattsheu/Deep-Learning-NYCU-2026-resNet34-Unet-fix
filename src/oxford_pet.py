@@ -207,17 +207,18 @@ class OxfordPetDataset(Dataset):
         mask = self.letterbox_mask(mask)
 
         if self.split == "train":
-            # 1. 零成本變換
+            # 1. 安全的翻轉 (維持 50%)
             if random.random() > 0.5:
                 image = TF.hflip(image)
                 mask = TF.hflip(mask)
 
-            # 2. 幾何變形 (三選一，或者都不做)
+            # -----------------------------------------
+            # 🌟 第二組：輕度幾何變形 (60%機率執行其一，40%維持原狀)
+            # -----------------------------------------
             geom_choice = random.random()
-
             if geom_choice < 0.2:
-                # 20% 機率執行：旋轉
-                angle = random.uniform(-15.0, 15.0)
+                # 只做 ±10 度的微小旋轉
+                angle = random.uniform(-10.0, 10.0)
                 image = TF.rotate(
                     image, angle, interpolation=InterpolationMode.BILINEAR, fill=0
                 )
@@ -225,39 +226,37 @@ class OxfordPetDataset(Dataset):
                     mask, angle, interpolation=InterpolationMode.NEAREST, fill=0
                 )
 
-            elif geom_choice < 0.5:
-                # 20% 機率執行：平移縮放
+            elif geom_choice < 0.4:
+                # 輕微平移與縮放 (0.95 ~ 1.05)
                 affine = v2.RandomAffine(
-                    degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)
+                    degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)
                 )
                 image, mask = affine(image, mask)
 
             elif geom_choice < 0.6:
+                # 微量彈性變形 (模擬組織蠕動，alpha值縮小)
                 w, h = image.size
                 base_size = max(w, h)
-                # elastic_alpha = base_size * 1.5
-                # elastic_sigma = base_size * 0.025
-                elastic_alpha = base_size * 1.25
-                elastic_sigma = base_size * 0.03
-                elastic = v2.ElasticTransform(alpha=elastic_alpha, sigma=elastic_sigma)
+                elastic = v2.ElasticTransform(
+                    alpha=base_size * 0.5, sigma=base_size * 0.02
+                )
                 image, mask = elastic(image, mask)
 
-            # 3. 色彩與光學 (三選一，或者都不做)
+            # -----------------------------------------
+            # 🌟 第三組：重度色彩光學 (80%機率執行其一，20%維持原狀)
+            # 不影響解剖形狀，逼迫模型學習深層特徵
+            # -----------------------------------------
             color_choice = random.random()
-
             if color_choice < 0.2:
-                # 20% 機率執行：CLAHE 局部對比
                 image = apply_clahe(image)
-
             elif color_choice < 0.4:
-                # 20% 機率執行：亮度對比微調
-                brightness_factor = random.uniform(0.8, 1.2)
-                image = TF.adjust_brightness(image, brightness_factor)
-                contrast_factor = random.uniform(0.8, 1.2)
-                image = TF.adjust_contrast(image, contrast_factor)
-
+                image = TF.adjust_brightness(image, random.uniform(0.8, 1.2))
+                image = TF.adjust_contrast(image, random.uniform(0.8, 1.2))
             elif color_choice < 0.6:
                 image = add_gaussian_noise(image, sigma=0.05)
+            elif color_choice < 0.8:
+                blur = v2.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
+                image = blur(image)
 
         # 最後補邊與轉 tensor
         image_tensor = self.pad_and_tensor(image)

@@ -3,6 +3,7 @@ import csv
 import os
 
 import numpy as np
+import scipy.ndimage as ndimage  # 🌟 引入形態學處理
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -274,6 +275,28 @@ def run_inference(args):
             final_probs = (probs1 + probs2) / 2.0
             preds = (final_probs > threshold).float()
 
+            # 🌟 形態學後處理 (補破洞 + 濾除碎斑)
+            preds_np_raw = preds.cpu().numpy()
+            processed_np = np.zeros_like(preds_np_raw)
+
+            for i in range(preds_np_raw.shape[0]):
+                mask_2d = preds_np_raw[i, 0]
+
+                # 1. 填補內部不合理的破洞
+                mask_filled = ndimage.binary_fill_holes(mask_2d)
+
+                # 2. 保留最大的連通區塊 (去除遠處不合理的獨立碎斑)
+                labeled, num_feat = ndimage.label(mask_filled)
+                if num_feat > 1:
+                    sizes = ndimage.sum(mask_filled, labeled, range(1, num_feat + 1))
+                    largest = np.argmax(sizes) + 1
+                    processed_np[i, 0] = labeled == largest
+                else:
+                    processed_np[i, 0] = mask_filled
+
+            # 將後處理結果轉回 Tensor
+            preds = torch.from_numpy(processed_np).to(device).float()
+
             if gt_available:
                 batch_dice = calculate_dice_score(preds, gt_masks)
                 batch_size_actual = images.size(0)
@@ -359,7 +382,7 @@ def build_argparser():
         "--model-type",
         type=str,
         default="ResNet34_UNet",
-        choices=["ResNet34_UNet", "ResNet34_UNet"],
+        choices=["ResNet34_UNet", "UNet"],
         help="Model architecture hint (ignored if --model-path filename clearly indicates model type)",
     )
     parser.add_argument(

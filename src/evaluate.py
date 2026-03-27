@@ -4,10 +4,9 @@ from utils import calculate_dice_score
 
 def evaluate(model, dataloader, device):
     """
-    TODO:
-    1. 將模型設為 eval 模式 (model.eval())。
-    2. 關閉梯度計算 (torch.no_grad())。
-    3. 跑過整個 validation dataloader，計算平均的 Loss 與 Dice Score。
+    評估模型在驗證集上的表現。
+    這裡我們不加入形態學後處理，以反映模型神經網路本身的真實輸出能力，
+    方便判斷模型是否真的學到了好特徵。後處理統一交由 inference.py 在最後生成 Kaggle 提交檔時處理。
     """
     model.eval()
     total_dice = 0.0
@@ -18,8 +17,11 @@ def evaluate(model, dataloader, device):
             image = image.to(device)
             mask = mask.to(device)
 
-            pred = model(image)
-            batch_dice = calculate_dice_score(pred, mask)
+            # 預測輸出 logits
+            pred_logits = model(image)
+
+            # 直接計算 dice score，不經過 postprocess_batch_tensors
+            batch_dice = calculate_dice_score(pred_logits, mask)
 
             batch_size = image.size(0)
             total_dice += batch_dice * batch_size
