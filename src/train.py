@@ -64,14 +64,22 @@ def train(
     if use_cuda:
         torch.backends.cudnn.benchmark = True
 
+    # 自動選擇合適的 num_workers 以避免警告
+    num_workers = min(4, os.cpu_count()) if os.cpu_count() else 2
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=Batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=use_cuda,
     )
-    val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )  # 驗證集也可以開一樣的數量的 worker 來加速
 
     model = UNet().to(device) if model_type == "UNet" else ResNet34_UNet().to(device)
 
@@ -97,7 +105,15 @@ def train(
     )
 
     amp_enabled = use_cuda and (not disable_amp)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            scaler = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
+        except TypeError:
+            scaler = torch.amp.GradScaler(enabled=amp_enabled)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
     save_dir = os.path.join(project_root, "saved_models")
     os.makedirs(save_dir, exist_ok=True)
     best_dice = 0.0
@@ -113,7 +129,14 @@ def train(
             image = image.to(device, non_blocking=use_cuda)
             mask = mask.to(device, non_blocking=use_cuda)
 
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            if amp_enabled and hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+                autocast_context = torch.amp.autocast(device_type="cuda", enabled=True)
+            elif amp_enabled:
+                autocast_context = torch.cuda.amp.autocast(enabled=True)
+            else:
+                autocast_context = nullcontext()
+
+            with autocast_context:
                 out = model(image)
 
                 # 🌟 三重強效 Loss 融合 (包含邊界約束)

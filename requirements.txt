@@ -6,7 +6,7 @@ datasets
 torchinfo
 torch
 torchvision
-
+scipy
 # --extra-index-url https://download.pytorch.org/whl/cu130
 # torch==2.6.0+cu130
 # torchvision==0.21.0+cu130
