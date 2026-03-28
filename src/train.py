@@ -79,7 +79,8 @@ def train(
     criterion_ft = FocalTverskyLoss()
     ema = EMA(model, decay=0.999)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda and (not disable_amp))
+    amp_enabled = use_cuda and (not disable_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     save_dir = os.path.join(project_root, "saved_models")
     os.makedirs(save_dir, exist_ok=True)
@@ -99,7 +100,7 @@ def train(
             image = image.to(device, non_blocking=use_cuda)
             mask = mask.to(device, non_blocking=use_cuda)
 
-            with torch.cuda.amp.autocast(enabled=use_cuda and (not disable_amp)):
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
                 out = model(image)
                 loss = 0.5 * criterion_ft(out, mask) + 0.5 * dice_loss_from_logits(
                     out, mask

@@ -55,16 +55,21 @@ class EMA:
         self.decay = decay
         self.shadow = {}
         self.backup = {}
+        self.step = 0
 
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
 
     def update(self):
+        self.step += 1
+        current_decay = min(self.decay, (1.0 + self.step) / (10.0 + self.step))
+
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 new_avg = (
-                    self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+                    current_decay * self.shadow[name]
+                    + (1.0 - current_decay) * param.data
                 )
                 self.shadow[name] = new_avg.clone()
 
