@@ -3,7 +3,6 @@ import csv
 import os
 
 import numpy as np
-import scipy.ndimage as ndimage  # 🌟 引入形態學處理
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -14,6 +13,7 @@ from models.resnet34_unet import ResNet34_UNet
 from models.unet import UNet
 from utils import (
     calculate_dice_score,
+    postprocess_batch_tensors,
     visualize_predictions_grid,
 )
 
@@ -248,7 +248,7 @@ def run_inference(args):
     vis_buffer = []
 
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Inference"):
+        for batch in tqdm(test_loader, desc="Inference (4-way TTA)"):
             if gt_available:
                 images, batch_image_ids, gt_masks, orig_sizes, vis_images = batch
                 gt_masks = gt_masks.to(device)
@@ -257,48 +257,23 @@ def run_inference(args):
                 gt_masks = None
 
             images = images.to(device)
-            # logits = model(images)
-            # probs = torch.sigmoid(logits)
-            # preds = (probs > threshold).float()
 
-            # 原始預測
-            logits = model(images)
-            probs1 = torch.sigmoid(logits)
+            # 4-way TTA
+            probs1 = torch.sigmoid(model(images))
 
-            # TTA: 水平翻轉預測
-            images_flipped = torch.flip(images, dims=[3])
-            logits_flipped = model(images_flipped)
-            probs_flipped = torch.sigmoid(logits_flipped)
-            probs2 = torch.flip(probs_flipped, dims=[3])
+            probs2 = torch.flip(torch.sigmoid(model(torch.flip(images, [3]))), [3])
 
-            # 綜合兩次預測結果（平均）
-            final_probs = (probs1 + probs2) / 2.0
-            preds = (final_probs > threshold).float()
+            probs3 = torch.flip(torch.sigmoid(model(torch.flip(images, [2]))), [2])
 
-            # 🌟 形態學後處理 (補破洞 + 濾除碎斑)
-            preds_np_raw = preds.cpu().numpy()
-            processed_np = np.zeros_like(preds_np_raw)
+            images_rot = torch.rot90(images, 1, [2, 3])
+            probs4 = torch.rot90(torch.sigmoid(model(images_rot)), -1, [2, 3])
 
-            for i in range(preds_np_raw.shape[0]):
-                mask_2d = preds_np_raw[i, 0]
+            final_probs = (probs1 + probs2 + probs3 + probs4) / 4.0
 
-                # 1. 填補內部不合理的破洞
-                mask_filled = ndimage.binary_fill_holes(mask_2d)
-
-                # 2. 保留最大的連通區塊 (去除遠處不合理的獨立碎斑)
-                labeled, num_feat = ndimage.label(mask_filled)
-                if num_feat > 1:
-                    sizes = ndimage.sum(mask_filled, labeled, range(1, num_feat + 1))
-                    largest = np.argmax(sizes) + 1
-                    processed_np[i, 0] = labeled == largest
-                else:
-                    processed_np[i, 0] = mask_filled
-
-            # 將後處理結果轉回 Tensor
-            preds = torch.from_numpy(processed_np).to(device).float()
+            preds = postprocess_batch_tensors(final_probs, threshold=threshold)
 
             if gt_available:
-                batch_dice = calculate_dice_score(preds, gt_masks)
+                batch_dice = calculate_dice_score(preds, gt_masks, threshold=0.5)
                 batch_size_actual = images.size(0)
                 total_dice += batch_dice * batch_size_actual
                 total_count += batch_size_actual

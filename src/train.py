@@ -1,29 +1,25 @@
 import os
 import argparse
-import platform
-from contextlib import nullcontext
+import random
+import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from torchinfo import summary
 
 from oxford_pet import OxfordPetDataset
 from models.unet import UNet
 from models.resnet34_unet import ResNet34_UNet
 from evaluate import evaluate
+from utils import FocalTverskyLoss, dice_loss_from_logits, EMA
 
-# 🌟 從 utils 引入集成的 Losses
-from utils import (
-    focal_loss_from_logits,
-    dice_loss_from_logits,
-    boundary_loss_from_logits,
-)
 
-if platform.system() != "Windows":
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def train(
@@ -31,42 +27,37 @@ def train(
     Batch_size=24,
     Learning_rate=1e-4,
     model_type="ResNet34_UNet",
-    show_summary=False,
-    max_lr_mult=3.0,
     disable_amp=False,
 ):
+    set_seed(42)
+
     project_root = os.path.abspath(os.getcwd())
     data_dir = os.path.join(project_root, "dataset")
 
     if model_type == "UNet":
-        IMG_SIZE = 572
-        MASK_SIZE = 388
-        accumulation_steps = 4  # 🌟 UNet 硬體受限 Batch=4，我們累積4步(實質 Batch=16)
+        img_size, mask_size, accumulation_steps = 572, 388, 4
     else:
-        IMG_SIZE = 256
-        MASK_SIZE = 256
-        accumulation_steps = 1  # ResNet34 不需累積
+        img_size, mask_size, accumulation_steps = 256, 256, 1
 
     train_dataset = OxfordPetDataset(
-        data_dir=data_dir, split="train", image_size=IMG_SIZE, mask_size=MASK_SIZE
+        data_dir=data_dir,
+        split="train",
+        image_size=img_size,
+        mask_size=mask_size,
     )
     val_dataset = OxfordPetDataset(
-        data_dir=data_dir, split="val", image_size=IMG_SIZE, mask_size=MASK_SIZE
+        data_dir=data_dir,
+        split="val",
+        image_size=img_size,
+        mask_size=mask_size,
     )
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available() else "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
-
     if use_cuda:
         torch.backends.cudnn.benchmark = True
 
-    # 自動選擇合適的 num_workers 以避免警告
     num_workers = min(4, os.cpu_count()) if os.cpu_count() else 2
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=Batch_size,
@@ -79,49 +70,28 @@ def train(
         batch_size=Batch_size,
         shuffle=False,
         num_workers=num_workers,
-    )  # 驗證集也可以開一樣的數量的 worker 來加速
+    )
 
     model = UNet().to(device) if model_type == "UNet" else ResNet34_UNet().to(device)
 
-    if show_summary:
-        summary(model, input_size=(1, 3, IMG_SIZE, IMG_SIZE), device=device)
+    optimizer = optim.AdamW(model.parameters(), lr=Learning_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Epochs)
+    criterion_ft = FocalTverskyLoss()
+    ema = EMA(model, decay=0.999)
 
-    print(
-        f"device: {device}\ntraining by {model_type} model\nbatch size: {Batch_size} (Accumulation steps: {accumulation_steps})"
-    )
-
-    # 🌟 使用 AdamW 並給予明確的 Weight Decay 進行正則化防過擬合
-    optimizer = optim.AdamW(model.parameters(), lr=Learning_rate, weight_decay=1e-2)
-    max_lr = Learning_rate * max_lr_mult
-
-    # 🌟 校正 Scheduler 的步數，並延長暖身期 (pct_start=0.2)
-    total_steps_per_epoch = max(1, len(train_loader) // accumulation_steps)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=max_lr,
-        steps_per_epoch=total_steps_per_epoch,
-        epochs=Epochs,
-        pct_start=0.2,
-    )
-
-    amp_enabled = use_cuda and (not disable_amp)
-
-    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        try:
-            scaler = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
-        except TypeError:
-            scaler = torch.amp.GradScaler(enabled=amp_enabled)
-    else:
-        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda and (not disable_amp))
 
     save_dir = os.path.join(project_root, "saved_models")
     os.makedirs(save_dir, exist_ok=True)
     best_dice = 0.0
 
+    print(
+        f"Training {model_type} | Batch: {Batch_size} | LR: {Learning_rate} | EMA Enabled"
+    )
+
     for epoch in range(Epochs):
         model.train()
         loss_temp = 0.0
-        valid_steps = 0
         optimizer.zero_grad(set_to_none=True)
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{Epochs}")
 
@@ -129,27 +99,11 @@ def train(
             image = image.to(device, non_blocking=use_cuda)
             mask = mask.to(device, non_blocking=use_cuda)
 
-            if amp_enabled and hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
-                autocast_context = torch.amp.autocast(device_type="cuda", enabled=True)
-            elif amp_enabled:
-                autocast_context = torch.cuda.amp.autocast(enabled=True)
-            else:
-                autocast_context = nullcontext()
-
-            with autocast_context:
+            with torch.cuda.amp.autocast(enabled=use_cuda and (not disable_amp)):
                 out = model(image)
-
-                # 🌟 三重強效 Loss 融合 (包含邊界約束)
-                focal_l = focal_loss_from_logits(out, mask)
-                dice_l = dice_loss_from_logits(out, mask)
-                bound_l = boundary_loss_from_logits(out, mask)
-
-                if model_type == "UNet":
-                    loss = 0.4 * focal_l + 0.4 * dice_l + 0.2 * bound_l
-                else:
-                    loss = 0.2 * focal_l + 0.6 * dice_l + 0.2 * bound_l
-
-                # 🌟 梯度累積：將 Loss 除以累積步數
+                loss = 0.5 * criterion_ft(out, mask) + 0.5 * dice_loss_from_logits(
+                    out, mask
+                )
                 loss = loss / accumulation_steps
 
             if not torch.isfinite(loss):
@@ -157,7 +111,6 @@ def train(
 
             scaler.scale(loss).backward()
 
-            # 🌟 滿指定步數才進行權重更新
             if ((batch_idx + 1) % accumulation_steps == 0) or (
                 (batch_idx + 1) == len(train_loader)
             ):
@@ -166,42 +119,43 @@ def train(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
+                ema.update()
 
-            # 顯示時將 Loss 乘回原來大小
             current_loss = loss.item() * accumulation_steps
             loss_temp += current_loss
-            valid_steps += 1
             progress_bar.set_postfix({"Loss": f"{current_loss:.4f}"})
 
-        avg_train_loss = loss_temp / max(1, valid_steps)
-        print(f"Evaluating Epoch {epoch+1}...")
-        val_dice = evaluate(model, val_loader, device)
+        scheduler.step()
 
+        print(f"Evaluating Epoch {epoch+1}...")
+        ema.apply_shadow()
+
+        val_dice, best_th = evaluate(model, val_loader, device)
         print(
-            f"Epoch [{epoch+1}/{Epochs}] - Train Loss: {avg_train_loss:.4f} | Val Dice Score: {val_dice:.4f}"
+            f"Epoch [{epoch+1}/{Epochs}] - Train Loss: {loss_temp/len(train_loader):.4f} | "
+            f"Val Dice: {val_dice:.4f} (Thresh: {best_th:.2f})"
         )
 
         if val_dice > best_dice:
             best_dice = val_dice
             save_path = os.path.join(save_dir, f"best_{model_type}.pth")
             torch.save(model.state_dict(), save_path)
-            print(f"new model saved at {save_path}\n")
+            print(f"New best model saved (Dice: {best_dice:.4f})")
+
+        ema.restore()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch_size", type=int, default=24)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument(
         "--model_type",
         type=str,
         choices=["UNet", "ResNet34_UNet"],
         default="ResNet34_UNet",
     )
-    parser.add_argument("--show_summary", action="store_true")
-    parser.add_argument("--max_lr_mult", type=float, default=3.0)
     parser.add_argument("--disable_amp", action="store_true")
     args = parser.parse_args()
 
@@ -210,7 +164,5 @@ if __name__ == "__main__":
         args.batch_size,
         args.learning_rate,
         args.model_type,
-        args.show_summary,
-        args.max_lr_mult,
         args.disable_amp,
     )

@@ -1,33 +1,38 @@
 import torch
-from utils import calculate_dice_score
+from utils import calculate_dice_score, postprocess_batch_tensors
 
 
 def evaluate(model, dataloader, device):
-    """
-    評估模型在驗證集上的表現。
-    這裡我們不加入形態學後處理，以反映模型神經網路本身的真實輸出能力，
-    方便判斷模型是否真的學到了好特徵。後處理統一交由 inference.py 在最後生成 Kaggle 提交檔時處理。
-    """
     model.eval()
-    total_dice = 0.0
+
+    thresholds = [i / 100.0 for i in range(30, 75, 5)]
+    total_dice = {t: 0.0 for t in thresholds}
     total_samples = 0
 
     with torch.no_grad():
         for image, mask in dataloader:
             image = image.to(device)
             mask = mask.to(device)
-
-            # 預測輸出 logits
-            pred_logits = model(image)
-
-            # 直接計算 dice score，不經過 postprocess_batch_tensors
-            batch_dice = calculate_dice_score(pred_logits, mask)
+            logits = model(image)
+            probs = torch.sigmoid(logits)
 
             batch_size = image.size(0)
-            total_dice += batch_dice * batch_size
             total_samples += batch_size
 
-    if total_samples == 0:
-        return 0.0
+            for threshold in thresholds:
+                processed_preds = postprocess_batch_tensors(probs, threshold=threshold)
+                batch_dice = calculate_dice_score(processed_preds, mask, threshold=0.5)
+                total_dice[threshold] += batch_dice * batch_size
 
-    return total_dice / total_samples
+    if total_samples == 0:
+        return 0.0, 0.5
+
+    best_threshold = 0.5
+    best_dice = 0.0
+    for threshold in thresholds:
+        mean_dice = total_dice[threshold] / total_samples
+        if mean_dice > best_dice:
+            best_dice = mean_dice
+            best_threshold = threshold
+
+    return best_dice, best_threshold

@@ -1,35 +1,44 @@
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 import numpy as np
 import scipy.ndimage as ndimage
 
 
-def calculate_dice_score(pred, target):
-    """計算 Dice Score 供評估使用 (平滑值改為安全的 1e-5)"""
-    pred = pred.float()
-    target = target.float()
-
-    if pred.min() < 0 or pred.max() > 1:
-        pred = torch.sigmoid(pred)
-
-    pred = (pred > 0.5).float()
-    pred = pred.view(pred.size(0), -1)
-    target = target.view(target.size(0), -1)
-
-    intersection = (pred * target).sum(dim=1)
-    denominator = pred.sum(dim=1) + target.sum(dim=1)
-    dice = (2.0 * intersection + 1e-5) / (denominator + 1e-5)
-    return dice.mean().item()
-
-
 # ==========================================
-# 🌟 損失函數區 (Loss Functions)
+# 1. Top-tier Loss (Focal Tversky Loss)
 # ==========================================
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, alpha=0.7, beta=0.3, gamma=0.75, smooth=1e-6):
+        """
+        alpha: penalty for false positives
+        beta: penalty for false negatives
+        gamma: focal modulation factor
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        preds = torch.sigmoid(logits)
+        preds = preds.view(-1)
+        targets = targets.float().view(-1)
+
+        tp = (preds * targets).sum()
+        fp = ((1 - targets) * preds).sum()
+        fn = (targets * (1 - preds)).sum()
+
+        tversky = (tp + self.smooth) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth
+        )
+        return (1 - tversky) ** self.gamma
+
+
 def dice_loss_from_logits(logits, targets, smooth=1e-5):
     probs = torch.sigmoid(logits).float()
-    targets = targets.float()
+    targets = targets.float().view(targets.size(0), -1)
     probs = probs.view(probs.size(0), -1)
-    targets = targets.view(targets.size(0), -1)
     intersection = (probs * targets).sum(dim=1)
     dice = (2.0 * intersection + smooth) / (
         probs.sum(dim=1) + targets.sum(dim=1) + smooth
@@ -37,54 +46,69 @@ def dice_loss_from_logits(logits, targets, smooth=1e-5):
     return 1.0 - dice.mean()
 
 
-def focal_loss_from_logits(logits, targets, alpha=0.25, gamma=2.0):
-    bce_loss = F.binary_cross_entropy_with_logits(
-        logits, targets.float(), reduction="none"
-    )
-    pt = torch.exp(-torch.clamp(bce_loss, max=100.0))
-    focal_loss = alpha * (1 - pt) ** gamma * bce_loss
-    return focal_loss.mean()
+# ==========================================
+# 2. Exponential Moving Average (EMA)
+# ==========================================
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
 
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
 
-def boundary_loss_from_logits(logits, targets):
-    """
-    邊界損失 (Boundary Loss)：
-    利用 MaxPool 產生形態學的膨脹與侵蝕，快速萃取預測機率與標籤的「邊緣輪廓」，
-    強迫模型不能只對準面積，還要完美貼合形狀與邊緣。
-    """
-    probs = torch.sigmoid(logits)
-    targets_float = targets.float()
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                new_avg = (
+                    self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+                )
+                self.shadow[name] = new_avg.clone()
 
-    # 預測邊緣
-    probs_dilated = F.max_pool2d(probs, kernel_size=3, stride=1, padding=1)
-    probs_eroded = -F.max_pool2d(-probs, kernel_size=3, stride=1, padding=1)
-    probs_boundary = probs_dilated - probs_eroded
+    def apply_shadow(self):
+        """Apply EMA weights before validation/checkpoint."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
 
-    # 真實邊緣
-    targets_dilated = F.max_pool2d(targets_float, kernel_size=3, stride=1, padding=1)
-    targets_eroded = -F.max_pool2d(-targets_float, kernel_size=3, stride=1, padding=1)
-    targets_boundary = targets_dilated - targets_eroded
-
-    return F.mse_loss(probs_boundary, targets_boundary)
+    def restore(self):
+        """Restore training weights after validation/checkpoint."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
 
 
 # ==========================================
-# 🌟 後處理區 (Post-processing)
+# 3. Evaluation and post-processing
 # ==========================================
-def postprocess_batch_tensors(preds_tensor):
-    """
-    形態學後處理：填補孔洞 (Hole Filling) 與 保留最大連通域 (Largest Connected Component)
-    能瞬間消除遠處的 False Positives (碎斑)，並讓腫瘤/器官實體更符合解剖學邏輯。
-    """
-    preds_np = (torch.sigmoid(preds_tensor) > 0.5).cpu().numpy()
+def calculate_dice_score(probs, targets, threshold=0.5):
+    """Calculate Dice score from sigmoid probabilities."""
+    preds = (probs > threshold).float()
+    preds = preds.view(preds.size(0), -1)
+    targets = targets.float().view(targets.size(0), -1)
+
+    intersection = (preds * targets).sum(dim=1)
+    denominator = preds.sum(dim=1) + targets.sum(dim=1)
+    dice = (2.0 * intersection + 1e-5) / (denominator + 1e-5)
+    return dice.mean().item()
+
+
+def postprocess_batch_tensors(preds_tensor, threshold=0.5):
+    """Morphological post-processing with hole fill + largest component."""
+    if preds_tensor.max() > 1.0 or preds_tensor.min() < 0.0:
+        preds_tensor = torch.sigmoid(preds_tensor)
+
+    preds_np = (preds_tensor > threshold).cpu().numpy()
     processed_np = np.zeros_like(preds_np)
 
     for i in range(preds_np.shape[0]):
         mask = preds_np[i, 0]
-        # 1. 填補內部不合理的破洞
         mask_filled = ndimage.binary_fill_holes(mask)
-
-        # 2. 保留最大的連通區塊 (假設每張圖只有一個主要實體)
         labeled, num_feat = ndimage.label(mask_filled)
         if num_feat > 1:
             sizes = ndimage.sum(mask_filled, labeled, range(1, num_feat + 1))
@@ -96,22 +120,18 @@ def postprocess_batch_tensors(preds_tensor):
     return torch.from_numpy(processed_np).to(preds_tensor.device).float()
 
 
-# 你可以在這裡加入其他的輔助函式，例如視覺化預測結果的 function
-
-
 def visualize_predictions(image, pred_mask, target_mask=None, save_path=None):
     """
-    視覺化預測結果
+    Visualize prediction results.
 
     Args:
-        image: 輸入圖像 (C, H, W) 或 (H, W)
-        pred_mask: 預測的 mask (H, W)
-        target_mask: 目標的 mask (H, W)，可選
-        save_path: 保存圖像的路徑，如果為 None 則只顯示
+        image: input image tensor/array
+        pred_mask: predicted mask
+        target_mask: ground-truth mask, optional
+        save_path: output path, optional
     """
     import matplotlib.pyplot as plt
 
-    # 轉換為 numpy
     if isinstance(image, torch.Tensor):
         image = image.cpu().numpy()
     if isinstance(pred_mask, torch.Tensor):
@@ -119,12 +139,10 @@ def visualize_predictions(image, pred_mask, target_mask=None, save_path=None):
     if isinstance(target_mask, torch.Tensor):
         target_mask = target_mask.cpu().numpy()
 
-    # 處理圖像形狀
     if image.ndim == 3:
         image = np.transpose(image, (1, 2, 0))
         image = np.squeeze(image)
 
-    # 建立圖表
     num_plots = 3 if target_mask is not None else 2
     fig, axes = plt.subplots(1, num_plots, figsize=(15, 5))
 
@@ -156,7 +174,7 @@ def visualize_predictions(image, pred_mask, target_mask=None, save_path=None):
 
 def visualize_predictions_grid(samples):
     """
-    將多個預測結果畫在同一張圖上。
+    Plot multiple prediction results on one figure.
 
     Args:
         samples: list of tuples (image_id, image, pred_mask, target_mask)
@@ -170,7 +188,6 @@ def visualize_predictions_grid(samples):
     has_target = samples[0][3] is not None
     num_cols = 3 if has_target else 2
 
-    # Make a more compact canvas so the whole grid is easier to view on screen.
     cell_w = 3.2
     cell_h = 2.4
     fig, axes = plt.subplots(
@@ -179,12 +196,10 @@ def visualize_predictions_grid(samples):
         figsize=(cell_w * num_cols, cell_h * num_samples),
     )
 
-    # 確保 axes 是二維的，即使只有一個樣本
     if num_samples == 1:
         axes = np.expand_dims(axes, axis=0)
 
     for i, (image_id, image, pred_mask, target_mask) in enumerate(samples):
-        # 轉換為 numpy
         if isinstance(image, torch.Tensor):
             image = image.cpu().numpy()
         if isinstance(pred_mask, torch.Tensor):
@@ -192,7 +207,6 @@ def visualize_predictions_grid(samples):
         if isinstance(target_mask, torch.Tensor):
             target_mask = target_mask.cpu().numpy()
 
-        # 處理圖像形狀
         if image.ndim == 3:
             image = np.transpose(image, (1, 2, 0))
             image = np.squeeze(image)
